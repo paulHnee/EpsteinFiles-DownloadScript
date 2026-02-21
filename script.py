@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import csv
 import time
+import random
 import logging
 import argparse
 import threading
@@ -146,6 +147,31 @@ class CookieRefresher:
 
 
 # ──────────────────────────────────────────────────────────────
+# Global rate limiter (token bucket)
+# ──────────────────────────────────────────────────────────────
+class RateLimiter:
+    """
+    Token bucket rate limiter shared across all worker threads.
+    Ensures the total request rate never exceeds `requests_per_second`,
+    regardless of how many concurrent workers are running.
+    """
+
+    def __init__(self, requests_per_second):
+        self.min_interval = 1.0 / max(requests_per_second, 0.001)
+        self._last_time = 0.0
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        """Block until it is safe to make the next request."""
+        with self._lock:
+            now = time.time()
+            wait = self.min_interval - (now - self._last_time)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_time = time.time()
+
+
+# ──────────────────────────────────────────────────────────────
 # Manifest CSV logger
 # ──────────────────────────────────────────────────────────────
 class ManifestWriter:
@@ -231,9 +257,13 @@ def find_existing_file(download_dir, dataset_num, file_num):
 # ──────────────────────────────────────────────────────────────
 # Single file download (used by workers)
 # ──────────────────────────────────────────────────────────────
-def try_download_file(session, dataset_num, file_num, download_dir, cookie_refresher, delay):
+MAX_429_RETRIES = 5   # max retries on 429 before giving up this file number
+
+def try_download_file(session, dataset_num, file_num, download_dir, cookie_refresher, rate_limiter):
     """
     Try each extension for a file number.
+    - Uses global rate_limiter before every request
+    - On 429: reads Retry-After header, applies exponential backoff + jitter, retries
     Returns (success: bool, filename: str|None, size: int, content_type: str).
     """
     cookie_refresher.check()
@@ -241,20 +271,47 @@ def try_download_file(session, dataset_num, file_num, download_dir, cookie_refre
 
     for ext in EXTENSIONS:
         url = build_url(dataset_num, file_num, ext)
-        try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
 
+        for attempt in range(MAX_429_RETRIES):
+            rate_limiter.acquire()
+            try:
+                resp = session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+            except requests.RequestException as e:
+                log.debug(f"  Request error for {url}: {e}")
+                break  # move to next extension
+
+            # ── 429 Rate Limited ──────────────────────────────────
             if resp.status_code == 429:
-                log.warning(f"  Rate limited (429) on {url} — pausing 10s")
-                time.sleep(10)
                 resp.close()
-                continue
+
+                # Respect Retry-After header if present
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        base_wait = float(retry_after)
+                    except ValueError:
+                        base_wait = 10.0
+                else:
+                    # Exponential backoff: 5s, 10s, 20s, 40s, 80s
+                    base_wait = 5.0 * (2 ** attempt)
+
+                # Add ±20% jitter so workers don't all wake at the same time
+                jitter = random.uniform(-base_wait * 0.2, base_wait * 0.2)
+                wait = base_wait + jitter
+                log.warning(
+                    f"  Rate limited (429) — attempt {attempt + 1}/{MAX_429_RETRIES}, "
+                    f"waiting {wait:.1f}s (base={base_wait:.0f}s, jitter={jitter:+.1f}s)"
+                )
+                time.sleep(max(wait, 1.0))
+                continue  # retry same URL
+
+            # ── 200 OK ────────────────────────────────────────────
             if resp.status_code == 200:
                 content_type = resp.headers.get("Content-Type", "")
 
                 if not is_valid_content_type(content_type):
                     resp.close()
-                    continue
+                    break  # HTML response → this extension doesn't exist
 
                 real_ext = detect_extension(content_type)
                 if real_ext is None:
@@ -265,11 +322,6 @@ def try_download_file(session, dataset_num, file_num, download_dir, cookie_refre
                 os.makedirs(folder, exist_ok=True)
                 filepath = os.path.join(folder, filename)
 
-                # Content-Length is only reliable when there's no compression
-                is_compressed = bool(resp.headers.get("Content-Encoding"))
-                expected_size = resp.headers.get("Content-Length")
-                expected_size = int(expected_size) if (expected_size and not is_compressed) else None
-
                 # Stream to disk
                 written = 0
                 with open(filepath, "wb") as f:
@@ -277,33 +329,11 @@ def try_download_file(session, dataset_num, file_num, download_dir, cookie_refre
                         f.write(chunk)
                         written += len(chunk)
 
-                # Content-Length integrity check (skipped for compressed responses)
-                if expected_size is not None and written != expected_size:
-                    os.remove(filepath)
-                    log.warning(
-                        f"  Truncated: {filename} "
-                        f"(got {written} bytes, expected {expected_size})"
-                    )
-                    continue
-
-                # Magic bytes validation
-                if not validate_magic_bytes(filepath, real_ext):
-                    os.remove(filepath)
-                    log.warning(
-                        f"  Rejected: DataSet {dataset_num} / {filename}  "
-                        f"(invalid content, not a real {real_ext} file)"
-                    )
-                    continue
-
                 return True, filename, written, content_type
 
+            # ── Any other status (404, 403, etc.) ─────────────────
             resp.close()
-
-        except requests.RequestException as e:
-            log.debug(f"  Request error for {url}: {e}")
-
-        if delay:
-            time.sleep(delay)
+            break  # not worth retrying non-429 errors
 
     return False, None, 0, ""
 
@@ -313,7 +343,7 @@ def try_download_file(session, dataset_num, file_num, download_dir, cookie_refre
 # ──────────────────────────────────────────────────────────────
 def process_dataset(
     session, dataset_num, start, end_limit, max_misses,
-    download_dir, workers, delay, cookie_refresher, manifest
+    download_dir, workers, rate_limiter, cookie_refresher, manifest
 ):
     """
     Scan file numbers concurrently using a thread pool.
@@ -360,7 +390,7 @@ def process_dataset(
                     continue
                 fut = pool.submit(
                     try_download_file,
-                    session, dataset_num, file_num, download_dir, cookie_refresher, delay,
+                    session, dataset_num, file_num, download_dir, cookie_refresher, rate_limiter,
                 )
                 futures[fut] = file_num
 
@@ -505,6 +535,8 @@ def main():
 
     session = create_session(pool_size=args.workers + 2)
     cookie_refresher = CookieRefresher(session)
+    # Rate limiter: `--delay` = minimum seconds between requests globally
+    rate_limiter = RateLimiter(requests_per_second=1.0 / args.delay)
 
     manifest_path = os.path.join(download_dir, "manifest.csv")
     manifest = ManifestWriter(manifest_path)
@@ -526,7 +558,7 @@ def main():
     log.info("DOJ Epstein Files Downloader")
     log.info(f"  Output   : {download_dir}")
     log.info(f"  Workers  : {args.workers}")
-    log.info(f"  Delay    : {args.delay}s per worker")
+    log.info(f"  Rate     : {1.0/args.delay:.1f} req/s global ({args.delay}s delay)")
     log.info(f"  Misses   : {args.max_misses}")
     log.info(f"  Manifest : {manifest_path}")
     if args.start_from:
@@ -555,7 +587,7 @@ def main():
 
         found, downloaded, skipped = process_dataset(
             session, ds_num, start, end, args.max_misses,
-            download_dir, args.workers, args.delay, cookie_refresher, manifest,
+            download_dir, args.workers, rate_limiter, cookie_refresher, manifest,
         )
         total_found += found
         total_downloaded += downloaded

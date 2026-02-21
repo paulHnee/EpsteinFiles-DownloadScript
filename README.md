@@ -56,7 +56,7 @@ python script.py --verify
 | `-o`, `--output` | `E:\Epstein` | Download directory |
 | `-w`, `--workers` | `3` | Concurrent download threads |
 | `-m`, `--max-misses` | `50` | Stop scanning after N consecutive 404s |
-| `-d`, `--delay` | `0.5` | Delay in seconds between requests per worker |
+| `-d`, `--delay` | `0.5` | Min seconds between requests **globally** across all workers (e.g. `0.5` = 2 req/s) |
 | `--datasets` | all | Comma-separated dataset numbers (e.g. `1,2,12`) |
 | `--start-from` | — | Start scanning from this EFTA file number |
 | `--verify` | — | Check existing files for corruption (no downloads) |
