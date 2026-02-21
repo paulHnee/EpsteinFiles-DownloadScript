@@ -26,11 +26,24 @@ CHUNK_SIZE = 8192
 # Content-Type → file extension mapping
 CONTENT_TYPE_MAP = {
     "application/pdf":  ".pdf",
+    "application/octet-stream": None,  # decide by magic bytes
     "video/quicktime":  ".mov",
     "video/mp4":        ".mov",
     "image/png":        ".png",
     "image/jpeg":       ".jpg",
     "image/jpg":        ".jpg",
+}
+
+# Reject these content types (HTML error pages served as 200)
+REJECT_CONTENT_TYPES = {"text/html", "text/plain", "application/xhtml+xml"}
+
+# Magic bytes to verify file type after download
+MAGIC_BYTES = {
+    ".pdf":  b"%PDF",
+    ".png":  b"\x89PNG",
+    ".jpg":  b"\xff\xd8\xff",
+    ".jpeg": b"\xff\xd8\xff",
+    # MOV/MP4 — "ftyp" at offset 4, or "moov"/"mdat" at offset 4
 }
 
 # Each tuple: (dataset_number, first_known_file_number)
@@ -76,6 +89,37 @@ def detect_extension(content_type):
     return CONTENT_TYPE_MAP.get(ct)
 
 
+def is_valid_content_type(content_type):
+    """Return False if the response is an HTML page (fake 200)."""
+    if not content_type:
+        return True  # no header, try anyway
+    ct = content_type.split(";")[0].strip().lower()
+    return ct not in REJECT_CONTENT_TYPES
+
+
+def validate_magic_bytes(filepath, ext):
+    """Check if the first bytes of the file match the expected format."""
+    expected = MAGIC_BYTES.get(ext)
+    if expected is None:
+        # For .mov and unknown types, just check it's not HTML
+        try:
+            with open(filepath, "rb") as f:
+                head = f.read(64)
+            # If it starts with HTML tags, it's a fake file
+            if head.lstrip().startswith((b"<", b"<!DOCTYPE", b"<!doctype")):
+                return False
+            return True
+        except OSError:
+            return False
+
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(len(expected))
+        return head.startswith(expected)
+    except OSError:
+        return False
+
+
 def already_downloaded(download_dir, dataset_num, file_num):
     """Check if any version of this file number already exists locally."""
     folder = os.path.join(download_dir, f"DataSet {dataset_num}")
@@ -90,8 +134,10 @@ def already_downloaded(download_dir, dataset_num, file_num):
 def try_download_file(session, dataset_num, file_num, download_dir, delay):
     """
     Try each extension for a file number. On the first 200 response:
+    - Reject if Content-Type is HTML (fake 200 error page)
     - Read Content-Type to detect real file type
-    - Stream-download immediately
+    - Stream-download and validate magic bytes
+    - Delete the file if validation fails
     - Return (True, filename) on success
     Returns (False, None) if file doesn't exist in any format.
     """
@@ -103,8 +149,17 @@ def try_download_file(session, dataset_num, file_num, download_dir, delay):
             resp = session.get(url, timeout=REQUEST_TIMEOUT, stream=True)
 
             if resp.status_code == 200:
+                content_type = resp.headers.get("Content-Type", "")
+
+                # Reject HTML error pages served as 200
+                if not is_valid_content_type(content_type):
+                    resp.close()
+                    if delay:
+                        time.sleep(delay)
+                    continue
+
                 # Detect real type from Content-Type header
-                real_ext = detect_extension(resp.headers.get("Content-Type"))
+                real_ext = detect_extension(content_type)
                 if real_ext is None:
                     real_ext = ext  # Fall back to the extension we requested
 
@@ -118,8 +173,18 @@ def try_download_file(session, dataset_num, file_num, download_dir, delay):
                     for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                         f.write(chunk)
 
+                # Validate magic bytes — delete if invalid
+                if not validate_magic_bytes(filepath, real_ext):
+                    os.remove(filepath)
+                    log.warning(
+                        f"  Rejected: DataSet {dataset_num} / {filename}  "
+                        f"(invalid content, not a real {real_ext} file)"
+                    )
+                    if delay:
+                        time.sleep(delay)
+                    continue
+
                 size_kb = os.path.getsize(filepath) / 1024
-                content_type = resp.headers.get("Content-Type", "unknown")
                 log.info(
                     f"  Downloaded: DataSet {dataset_num} / {filename}  "
                     f"({size_kb:.0f} KB, type: {content_type})"
@@ -222,6 +287,8 @@ def main():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     })
+    # DOJ age verification gate — setting this cookie bypasses the HTML redirect
+    session.cookies.set("justiceGovAgeVerified", "true", domain="www.justice.gov")
 
     download_dir = args.output
     os.makedirs(download_dir, exist_ok=True)

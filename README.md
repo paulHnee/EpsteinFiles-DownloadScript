@@ -64,6 +64,14 @@ python script.py --delay 0.1
 
 Last known file: `EFTA02731852` (DataSet 12)
 
+## Storage Estimate
+
+| Files | Avg. Size | Total Storage |
+|-------|-----------|---------------|
+| 2,700,000 | 400 KB | **~1.01 TB** |
+
+Note: Actual sizes will vary — scanned PDFs and images may be significantly larger, text-heavy documents smaller. Plan for extra headroom.
+
 ## Output Structure
 
 ```
