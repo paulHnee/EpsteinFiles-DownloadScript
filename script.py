@@ -19,7 +19,8 @@ Features:
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import os
 import csv
 import time
@@ -346,15 +347,16 @@ def process_dataset(
     download_dir, workers, rate_limiter, cookie_refresher, manifest
 ):
     """
-    Scan file numbers concurrently using a thread pool.
-    Submits batches of file numbers and tracks consecutive misses.
+    Scan file numbers concurrently using a persistent thread pool
+    with a sliding window of in-flight futures.
     """
+    WINDOW = workers * 10  # keep this many tasks in-flight at once
+
     found = 0
     skipped = 0
     downloaded = 0
     consecutive_misses = 0
-    current = start
-    batch_size = workers * 2  # keep the pool fed
+    next_num = start  # next file number to submit
 
     pbar = None
     if HAS_TQDM:
@@ -364,62 +366,60 @@ def process_dataset(
             dynamic_ncols=True,
         )
 
-    while current <= end_limit and consecutive_misses < max_misses:
-        # Build a batch of file numbers to check
-        batch = []
-        for i in range(batch_size):
-            num = current + i
-            if num > end_limit:
-                break
-            batch.append(num)
-        if not batch:
-            break
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque()  # (file_num, future | None); None = already on disk
 
-        # Submit batch to thread pool
-        futures = {}
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for file_num in batch:
+        def fill_window():
+            nonlocal next_num
+            while next_num <= end_limit and len(pending) < WINDOW:
+                file_num = next_num
+                next_num += 1
                 existing = find_existing_file(download_dir, dataset_num, file_num)
                 if existing:
-                    found += 1
-                    skipped += 1
-                    consecutive_misses = 0
-                    if pbar is not None:
-                        pbar.update(1)
-                        pbar.set_postfix(found=found, new=downloaded, skip=skipped)
-                    continue
-                fut = pool.submit(
-                    try_download_file,
-                    session, dataset_num, file_num, download_dir, cookie_refresher, rate_limiter,
-                )
-                futures[fut] = file_num
+                    pending.append((file_num, None))
+                else:
+                    fut = pool.submit(
+                        try_download_file,
+                        session, dataset_num, file_num,
+                        download_dir, cookie_refresher, rate_limiter,
+                    )
+                    pending.append((file_num, fut))
 
-            # Collect results in submission order for correct consecutive miss tracking
-            results = {}
-            for fut in as_completed(futures):
-                file_num = futures[fut]
-                results[file_num] = fut.result()
+        fill_window()
 
-        # Process results in order
-        for file_num in sorted(results.keys()):
-            success, filename, size, content_type = results[file_num]
-            if success:
+        while pending:
+            file_num, fut = pending.popleft()
+
+            if fut is None:
+                # Already on disk — counts as a hit, resets miss counter
                 found += 1
-                downloaded += 1
+                skipped += 1
                 consecutive_misses = 0
-                manifest.log(dataset_num, filename, size, content_type, "ok")
                 if pbar is not None:
                     pbar.update(1)
                     pbar.set_postfix(found=found, new=downloaded, skip=skipped)
             else:
-                consecutive_misses += 1
-                if pbar is not None:
-                    pbar.update(1)
+                success, filename, size, content_type = fut.result()
+                if success:
+                    found += 1
+                    downloaded += 1
+                    consecutive_misses = 0
+                    manifest.log(dataset_num, filename, size, content_type, "ok")
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix(found=found, new=downloaded, skip=skipped)
+                else:
+                    consecutive_misses += 1
+                    if pbar is not None:
+                        pbar.update(1)
 
             if consecutive_misses >= max_misses:
+                for _, f in pending:
+                    if f is not None:
+                        f.cancel()
                 break
 
-        current += len(batch)
+            fill_window()
 
     if pbar is not None:
         pbar.set_postfix(found=found, new=downloaded, skip=skipped)
@@ -427,7 +427,7 @@ def process_dataset(
 
     log.info(
         f"  DataSet {dataset_num} done — {found} files "
-        f"({downloaded} new, {skipped} skipped, stopped at EFTA{current - 1:08d})"
+        f"({downloaded} new, {skipped} skipped, stopped at EFTA{next_num - 1:08d})"
     )
     return found, downloaded, skipped
 
