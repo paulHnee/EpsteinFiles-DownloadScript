@@ -1,6 +1,6 @@
 # DOJ Epstein Files Downloader
 
-Python script to download publicly released documents from the [DOJ Epstein files](https://www.justice.gov/epstein/files) across all 12 DataSets.
+Python script to download publicly released documents from the [DOJ Epstein files](https://www.justice.gov/epstein/) across all 12 DataSets.
 
 ## Features
 
