@@ -1,0 +1,33 @@
+# Downloaded data
+DataSet 1/
+DataSet 2/
+DataSet 3/
+DataSet 4/
+DataSet 5/
+DataSet 6/
+DataSet 7/
+DataSet 8/
+DataSet 9/
+DataSet 10/
+DataSet 11/
+DataSet 12/
+downloads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
