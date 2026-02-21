@@ -4,23 +4,30 @@ Python script to download publicly released documents from the [DOJ Epstein file
 
 ## Features
 
-- Scans file numbers sequentially within each DataSet
-- Detects file type via `Content-Type` header (PDF, MOV, PNG, JPEG, JPG)
-- Downloads in a single pass (no separate existence check)
-- Skips files already downloaded (resume support)
-- Stops scanning a DataSet after N consecutive misses
-- Configurable delay between requests
+- Concurrent scanning & downloading (configurable thread pool)
+- Retry with exponential backoff (3 retries on 429/5xx errors)
+- Connection pool tuning for high throughput
+- Content-Type detection and magic bytes validation
+- Content-Length integrity check (catches truncated downloads)
+- Age-verification cookie with automatic refresh (~50 min cycle)
+- Progress bar via `tqdm` (optional)
+- `manifest.csv` log of every downloaded file
+- `--verify` mode to check existing files for corruption
+- `--start-from` to resume scanning mid-dataset
+- Skips files already on disk (resume support)
 
 ## Requirements
 
 ```
-pip install requests
+pip install requests tqdm
 ```
+
+`tqdm` is optional — the script works without it but won't show progress bars.
 
 ## Usage
 
 ```bash
-# Download all datasets to E:\Epstein\
+# Download all datasets
 python script.py
 
 # Download to a custom directory
@@ -29,11 +36,17 @@ python script.py -o "C:\Downloads\Epstein"
 # Download only specific datasets
 python script.py --datasets 1,2,12
 
+# Use 5 concurrent threads with a 1s delay (be gentle on the server)
+python script.py -w 5 -d 1.0
+
 # Increase miss threshold for more thorough scanning
 python script.py --max-misses 200
 
-# Adjust request delay (seconds)
-python script.py --delay 0.1
+# Resume from a specific file number
+python script.py --start-from 5000
+
+# Verify existing files for corruption (no downloading)
+python script.py --verify
 ```
 
 ## Options
@@ -41,9 +54,12 @@ python script.py --delay 0.1
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-o`, `--output` | `E:\Epstein` | Download directory |
+| `-w`, `--workers` | `3` | Concurrent download threads |
 | `-m`, `--max-misses` | `50` | Stop scanning after N consecutive 404s |
-| `-d`, `--delay` | `0.05` | Delay between requests in seconds |
+| `-d`, `--delay` | `0.5` | Delay in seconds between requests per worker |
 | `--datasets` | all | Comma-separated dataset numbers (e.g. `1,2,12`) |
+| `--start-from` | — | Start scanning from this EFTA file number |
+| `--verify` | — | Check existing files for corruption (no downloads) |
 
 ## DataSets
 
@@ -82,6 +98,16 @@ E:\Epstein\
 │   └── ...
 ├── DataSet 2\
 │   └── ...
-└── DataSet 12\
-    └── EFTA02731852.pdf
+├── DataSet 12\
+│   └── EFTA02731852.pdf
+└── manifest.csv
+```
+
+### manifest.csv
+
+Every successful download is logged with timestamp, dataset, filename, size, and content type:
+
+```csv
+timestamp,dataset,filename,size_bytes,content_type,status
+2026-02-21T14:30:00,1,EFTA00000001.pdf,373984,application/pdf,ok
 ```

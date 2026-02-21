@@ -12,6 +12,7 @@ DataSet 10/
 DataSet 11/
 DataSet 12/
 downloads/
+manifest.csv
 
 # Python
 __pycache__/
@@ -26,6 +27,7 @@ venv/
 # IDE
 .vscode/
 .idea/
+tmpclaude*
 
 # OS
 Thumbs.db
